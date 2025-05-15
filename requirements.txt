@@ -12,4 +12,4 @@ pydub
 transformers
 git+https://github.com/VarunGumma/IndicTransToolkit.git
 torch
--e .
+
