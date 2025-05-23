@@ -28,7 +28,7 @@ from IndicTransToolkit.processor import IndicProcessor
 
 app = Flask(__name__)
 CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # for file uploads upto 100mb
+app.config['MAX_CONTENT_LENGTH'] = 1000 * 1024 * 1024  # for file uploads upto 1000mb
 
 #GLobal varibales
 UPLOAD_FOLDER = 'uploads'
@@ -176,7 +176,7 @@ def diarize_and_segment(chunk_path, rttm_path):
 
         # Transcribe the segment
         transcript = extract_text_from_audio(segment_path, start_time=0, end_time=duration)
-        if transcript.strip() == "":
+        if not transcript or transcript.strip() == "":
             print(f" Skipping {segment_filename} — empty transcription")
             continue  # Skip embedding and labeling
 
@@ -232,12 +232,89 @@ def diarize_and_segment(chunk_path, rttm_path):
             f.write("\n".join(transcript_lines))
 
 def getTranslation(content):
-    global selected_language
-    
-    # recommended to run this on a gpu with flash_attn installed
-    # don't set attn_implemetation if you don't have flash_attn
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    def initialize_model_and_tokenizer(ckpt_dir, quantization):
+        if quantization == "4-bit":
+            qconfig = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+        elif quantization == "8-bit":
+            qconfig = BitsAndBytesConfig(
+                load_in_8bit=True,
+                bnb_8bit_use_double_quant=True,
+                bnb_8bit_compute_dtype=torch.bfloat16,
+            )
+        else:
+            qconfig = None
 
+        tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            ckpt_dir,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            quantization_config=qconfig,
+        )
+
+        if qconfig == None:
+            model = model.to(DEVICE)
+            if DEVICE == "cuda":
+                model.half()
+
+        model.eval()
+
+        return tokenizer, model
+
+
+    def batch_translate(input_sentences, src_lang, tgt_lang, model, tokenizer, ip):
+        translations = []
+        for i in range(0, len(input_sentences), BATCH_SIZE):
+            batch = input_sentences[i : i + BATCH_SIZE]
+
+            # Preprocess the batch and extract entity mappings
+            batch = ip.preprocess_batch(batch, src_lang=src_lang, tgt_lang=tgt_lang)
+
+            # Tokenize the batch and generate input encodings
+            inputs = tokenizer(
+                batch,
+                truncation=True,
+                padding="longest",
+                return_tensors="pt",
+                return_attention_mask=True,
+            ).to(DEVICE)
+
+            # Generate translations using the model
+            with torch.no_grad():
+                generated_tokens = model.generate(
+                    **inputs,
+                    use_cache=True,
+                    min_length=0,
+                    max_length=256,
+                    num_beams=5,
+                    num_return_sequences=1,
+                )
+
+            # Decode the generated tokens into text
+
+            with tokenizer.as_target_tokenizer():
+                generated_tokens = tokenizer.batch_decode(
+                    generated_tokens.detach().cpu().tolist(),
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
+
+            # Postprocess the translations, including entity replacement
+            translations += ip.postprocess_batch(generated_tokens, lang=tgt_lang)
+
+            del inputs
+            torch.cuda.empty_cache()
+
+        return translations
+
+    indic_en_ckpt_dir = "ai4bharat/indictrans2-indic-en-1B"  # ai4bharat/indictrans2-indic-en-dist-200M
+    indic_en_tokenizer, indic_en_model = initialize_model_and_tokenizer(indic_en_ckpt_dir, quantization)
+
+    ip = IndicProcessor(inference=True)
     if selected_language=="hi-IN":
         src_lang, tgt_lang = "hin_Deva", "eng_Latn"
     elif selected_language=="ta-IN":
@@ -258,58 +335,13 @@ def getTranslation(content):
         src_lang, tgt_lang = "pan_Guru", "eng_Latn"
     elif selected_language=="ur-IN":
         src_lang, tgt_lang = "urd_Arab", "eng_Latn"
-    model_name = "ai4bharat/indictrans2-indic-en-1B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    en_translations = batch_translate(content, src_lang, tgt_lang, indic_en_model, indic_en_tokenizer, ip)
+    
 
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_name, 
-        trust_remote_code=True, 
-        torch_dtype=torch.float16, # performance might slightly vary for bfloat16
-        attn_implementation="flash_attention_2"
-    ).to(DEVICE)
-
-    ip = IndicProcessor(inference=True)
-
-    input_sentences = content
-    batch = ip.preprocess_batch(
-        input_sentences,
-        src_lang=src_lang,
-        tgt_lang=tgt_lang,
-    )
-
-    # Tokenize the sentences and generate input encodings
-    inputs = tokenizer(
-        batch,
-        truncation=True,
-        padding="longest",
-        return_tensors="pt",
-        return_attention_mask=True,
-    ).to(DEVICE)
-
-    # Generate translations using the model
-    with torch.no_grad():
-        generated_tokens = model.generate(
-            **inputs,
-            use_cache=True,
-            min_length=0,
-            max_length=256,
-            num_beams=5,
-            num_return_sequences=1,
-        )
-
-    # Decode the generated tokens into text
-    generated_tokens = tokenizer.batch_decode(
-        generated_tokens,
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=True,
-    )
-
-    # Postprocess the translations, including entity replacement
-    en_translations = ip.postprocess_batch(generated_tokens, lang=tgt_lang)
-
-    for input_sentence, translation in zip(input_sentences, en_translations):
+    print(f"\n{src_lang} - {tgt_lang}")
+    for input_sentence, translation in zip(content, en_translations):
         print(f"{src_lang}: {input_sentence}")
-        print(f"{tgt_lang}: {en_translations}")
+        print(f"{tgt_lang}: {translation}")
         
     
     return en_translations
@@ -377,7 +409,7 @@ def process():
 
 @app.route('/clear', methods=['POST'])
 def clear():
-    global segment_counter
+    global segment_counter,selected_language
     print("clear was clicked")
 
     # Clear .wav files from the uploads folder
@@ -419,6 +451,7 @@ def clear():
             f.truncate(0)
         print("live.txt truncated (emptied).")
     segment_counter=1
+    selected_language='en-IN'
     return "Files cleared", 200
 
 
@@ -632,7 +665,7 @@ def get_summary_live():
 
 @app.route('/clear_live', methods=['POST'])
 def clearLive():
-    global segment_counter
+    global segment_counter,selected_language
     for folder in [VOICE_FOLDER, SEGMENT_DIR]:
         if os.path.exists(folder):
             print(f"Cleaning up {folder}: {os.listdir(folder)}")
@@ -650,6 +683,7 @@ def clearLive():
             f.truncate(0)
         print("live.txt truncated (emptied).")
     segment_counter=1
+    selected_language='en-IN'
     return jsonify({'status': '✅ All chunks, segments, and transcript cleared'})
 
 @app.route('/register-speaker', methods=['POST'])
